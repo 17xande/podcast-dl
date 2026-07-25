@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type rssFeed struct {
@@ -24,10 +25,38 @@ type rssFeed struct {
 
 type rssItem struct {
 	Title     string `xml:"title"`
+	PubDate   string `xml:"pubDate"`
 	Enclosure struct {
 		URL  string `xml:"url,attr"`
 		Type string `xml:"type,attr"`
 	} `xml:"enclosure"`
+}
+
+// pubDateLayouts covers the RFC 822/1123-style formats RSS feeds commonly
+// use for <pubDate>, plus a couple of common variants and RFC 3339 for
+// feeds that deviate from spec.
+var pubDateLayouts = []string{
+	time.RFC1123Z,
+	time.RFC1123,
+	"Mon, 2 Jan 2006 15:04:05 -0700",
+	"Mon, 2 Jan 2006 15:04:05 MST",
+	time.RFC3339,
+	"02 Jan 2006 15:04:05 -0700",
+}
+
+// parsePubDate parses an RSS <pubDate> value, returning ok=false if it's
+// empty or in a format we don't recognize.
+func parsePubDate(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range pubDateLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // itunesLookupURL is the iTunes Lookup API endpoint used to resolve an Apple
@@ -147,14 +176,72 @@ func episodeExtension(enclosureURL string) string {
 	return ext
 }
 
+// destinationPath builds the file path an episode should be saved to,
+// prefixing the sanitized title with its release date (YYYY-MM-DD) when the
+// feed provides a parseable pubDate.
 func destinationPath(outDir string, item rssItem) string {
-	name := sanitizeFilename(item.Title) + episodeExtension(item.Enclosure.URL)
-	return filepath.Join(outDir, name)
+	name := sanitizeFilename(item.Title)
+	if t, ok := parsePubDate(item.PubDate); ok {
+		name = t.Format("2006-01-02") + " - " + name
+	}
+	return filepath.Join(outDir, name+episodeExtension(item.Enclosure.URL))
+}
+
+// formatBytes renders a byte count in human-readable form, e.g. "4.2 MiB".
+func formatBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// progressLine renders a download progress status, including a percentage
+// when the total size is known.
+func progressLine(written, total int64) string {
+	if total > 0 {
+		pct := float64(written) / float64(total) * 100
+		return fmt.Sprintf("%s / %s (%.0f%%)", formatBytes(written), formatBytes(total), pct)
+	}
+	return formatBytes(written)
+}
+
+// progressWriter is an io.Writer that prints download progress to stdout as
+// bytes flow through it, throttled so it doesn't flood the terminal.
+type progressWriter struct {
+	total     int64
+	written   int64
+	lastPrint time.Time
+}
+
+func (p *progressWriter) Write(b []byte) (int, error) {
+	p.written += int64(len(b))
+	if now := time.Now(); now.Sub(p.lastPrint) >= 150*time.Millisecond {
+		p.print()
+		p.lastPrint = now
+	}
+	return len(b), nil
+}
+
+func (p *progressWriter) print() {
+	fmt.Printf("\r  %s", progressLine(p.written, p.total))
+}
+
+func (p *progressWriter) finish() {
+	p.print()
+	fmt.Println()
 }
 
 // downloadEpisode fetches the enclosure audio for item and writes it to
-// destPath, unless a file already exists there.
-func downloadEpisode(client *http.Client, item rssItem, destPath string) error {
+// destPath, unless a file already exists there. When pubTime is known, the
+// downloaded file's access/modification times are set to the episode's
+// release date.
+func downloadEpisode(client *http.Client, item rssItem, destPath string, pubTime time.Time, hasPubTime bool) error {
 	if _, err := os.Stat(destPath); err == nil {
 		fmt.Printf("skip (exists): %s\n", item.Title)
 		return nil
@@ -176,11 +263,23 @@ func downloadEpisode(client *http.Client, item rssItem, destPath string) error {
 	}
 	defer out.Close()
 
-	if _, err := io.Copy(out, resp.Body); err != nil {
+	fmt.Printf("downloading: %s\n", item.Title)
+	progress := &progressWriter{total: resp.ContentLength}
+	if _, err := io.Copy(io.MultiWriter(out, progress), resp.Body); err != nil {
+		fmt.Println()
 		return fmt.Errorf("saving %q: %w", item.Title, err)
 	}
+	progress.finish()
 
-	fmt.Printf("downloaded: %s\n", item.Title)
+	if hasPubTime {
+		if err := os.Chtimes(destPath, pubTime, pubTime); err != nil {
+			return fmt.Errorf("setting file date for %q: %w", item.Title, err)
+		}
+		if err := setCreationTime(destPath, pubTime); err != nil {
+			return fmt.Errorf("setting file creation date for %q: %w", item.Title, err)
+		}
+	}
+
 	return nil
 }
 
@@ -218,7 +317,8 @@ func run(inputURL, outDir string, all bool) error {
 
 	for _, item := range episodes {
 		dest := destinationPath(outDir, item)
-		if err := downloadEpisode(client, item, dest); err != nil {
+		pubTime, hasPubTime := parsePubDate(item.PubDate)
+		if err := downloadEpisode(client, item, dest, pubTime, hasPubTime); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 		}
 	}

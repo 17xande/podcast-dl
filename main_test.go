@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSanitizeFilename(t *testing.T) {
@@ -115,6 +116,91 @@ func TestResolveFeedURL(t *testing.T) {
 	})
 }
 
+func TestParsePubDate(t *testing.T) {
+	want := time.Date(2026, time.July, 25, 10, 30, 0, 0, time.FixedZone("", -4*3600))
+
+	cases := []struct {
+		name   string
+		input  string
+		wantOK bool
+	}{
+		{"RFC1123Z", "Sat, 25 Jul 2026 10:30:00 -0400", true},
+		{"RFC1123 with zone name", "Sat, 25 Jul 2026 10:30:00 EDT", true},
+		{"single digit day", "Sat, 5 Jul 2026 10:30:00 -0400", true},
+		{"RFC3339", "2026-07-25T10:30:00-04:00", true},
+		{"no weekday", "25 Jul 2026 10:30:00 -0400", true},
+		{"empty string", "", false},
+		{"garbage", "not a date", false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, ok := parsePubDate(c.input)
+			if ok != c.wantOK {
+				t.Errorf("parsePubDate(%q) ok = %v, want %v", c.input, ok, c.wantOK)
+			}
+		})
+	}
+
+	t.Run("parses correct instant", func(t *testing.T) {
+		got, ok := parsePubDate("Sat, 25 Jul 2026 10:30:00 -0400")
+		if !ok {
+			t.Fatal("expected ok=true")
+		}
+		if !got.Equal(want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+}
+
+func TestSetCreationTime(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "file.mp3")
+	if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {
+		t.Fatalf("setup: writing file: %v", err)
+	}
+
+	if err := setCreationTime(path, time.Date(2026, time.July, 25, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Errorf("setCreationTime returned error: %v", err)
+	}
+}
+
+func TestFormatBytes(t *testing.T) {
+	cases := []struct {
+		n    int64
+		want string
+	}{
+		{0, "0 B"},
+		{500, "500 B"},
+		{1024, "1.0 KiB"},
+		{1536, "1.5 KiB"},
+		{1048576, "1.0 MiB"},
+		{5 * 1048576, "5.0 MiB"},
+	}
+	for _, c := range cases {
+		if got := formatBytes(c.n); got != c.want {
+			t.Errorf("formatBytes(%d) = %q, want %q", c.n, got, c.want)
+		}
+	}
+}
+
+func TestProgressLine(t *testing.T) {
+	cases := []struct {
+		written, total int64
+		want           string
+	}{
+		{512, 1024, "512 B / 1.0 KiB (50%)"},
+		{1024, 1024, "1.0 KiB / 1.0 KiB (100%)"},
+		{2048, -1, "2.0 KiB"},
+		{2048, 0, "2.0 KiB"},
+	}
+	for _, c := range cases {
+		if got := progressLine(c.written, c.total); got != c.want {
+			t.Errorf("progressLine(%d, %d) = %q, want %q", c.written, c.total, got, c.want)
+		}
+	}
+}
+
 func TestParseFeed(t *testing.T) {
 	t.Run("multiple items", func(t *testing.T) {
 		xmlBody := `<?xml version="1.0"?>
@@ -203,6 +289,32 @@ func TestSelectEpisodes(t *testing.T) {
 	})
 }
 
+func TestDestinationPath(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("prefixes with release date when pubDate parses", func(t *testing.T) {
+		item := rssItem{Title: "Episode Title", PubDate: "Sat, 25 Jul 2026 10:30:00 -0400"}
+		item.Enclosure.URL = "https://example.com/ep.mp3"
+
+		got := destinationPath(dir, item)
+		want := filepath.Join(dir, "2026-07-25 - Episode Title.mp3")
+		if got != want {
+			t.Errorf("destinationPath = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("no date prefix when pubDate missing or invalid", func(t *testing.T) {
+		item := rssItem{Title: "Episode Title", PubDate: "not a date"}
+		item.Enclosure.URL = "https://example.com/ep.mp3"
+
+		got := destinationPath(dir, item)
+		want := filepath.Join(dir, "Episode Title.mp3")
+		if got != want {
+			t.Errorf("destinationPath = %q, want %q", got, want)
+		}
+	})
+}
+
 func TestEpisodeExtension(t *testing.T) {
 	cases := []struct {
 		url  string
@@ -241,7 +353,7 @@ func TestDownloadEpisode(t *testing.T) {
 			t.Fatalf("destinationPath = %q, want %q", dest, wantName)
 		}
 
-		if err := downloadEpisode(server.Client(), item, dest); err != nil {
+		if err := downloadEpisode(server.Client(), item, dest, time.Time{}, false); err != nil {
 			t.Fatalf("downloadEpisode returned error: %v", err)
 		}
 
@@ -251,6 +363,36 @@ func TestDownloadEpisode(t *testing.T) {
 		}
 		if string(got) != audioBody {
 			t.Errorf("file contents = %q, want %q", got, audioBody)
+		}
+	})
+
+	t.Run("sets file times to the episode release date", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("audio bytes"))
+		}))
+		defer server.Close()
+
+		dir := t.TempDir()
+		item := rssItem{Title: "Dated Episode", PubDate: "Sat, 25 Jul 2026 10:30:00 -0400"}
+		item.Enclosure.URL = server.URL + "/ep.mp3"
+		dest := destinationPath(dir, item)
+
+		pubTime, ok := parsePubDate(item.PubDate)
+		if !ok {
+			t.Fatal("setup: expected pubDate to parse")
+		}
+
+		if err := downloadEpisode(server.Client(), item, dest, pubTime, true); err != nil {
+			t.Fatalf("downloadEpisode returned error: %v", err)
+		}
+
+		info, err := os.Stat(dest)
+		if err != nil {
+			t.Fatalf("stat downloaded file: %v", err)
+		}
+		if !info.ModTime().Equal(pubTime) {
+			t.Errorf("file mod time = %v, want %v", info.ModTime(), pubTime)
 		}
 	})
 
@@ -272,7 +414,7 @@ func TestDownloadEpisode(t *testing.T) {
 			t.Fatalf("setup: writing existing file: %v", err)
 		}
 
-		if err := downloadEpisode(server.Client(), item, dest); err != nil {
+		if err := downloadEpisode(server.Client(), item, dest, time.Time{}, false); err != nil {
 			t.Fatalf("downloadEpisode returned error: %v", err)
 		}
 
@@ -300,7 +442,7 @@ func TestDownloadEpisode(t *testing.T) {
 		item.Enclosure.URL = server.URL + "/missing.mp3"
 		dest := filepath.Join(dir, "Missing.mp3")
 
-		if err := downloadEpisode(server.Client(), item, dest); err == nil {
+		if err := downloadEpisode(server.Client(), item, dest, time.Time{}, false); err == nil {
 			t.Fatal("expected error for 404 response, got nil")
 		}
 	})
