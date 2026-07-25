@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -230,40 +231,157 @@ func TestProgressLine(t *testing.T) {
 	}
 }
 
-func TestBatchETA(t *testing.T) {
-	cases := []struct {
-		avg       time.Duration
-		remaining int
-		want      time.Duration
-	}{
-		{30 * time.Second, 4, 2 * time.Minute},
-		{90 * time.Second, 1, 90 * time.Second},
-		{0, 5, 0},
+func TestCeilDiv(t *testing.T) {
+	cases := []struct{ a, b, want int }{
+		{10, 3, 4},
+		{9, 3, 3},
+		{0, 3, 0},
+		{5, 0, 5},
+		{5, -1, 5},
 	}
 	for _, c := range cases {
-		if got := batchETA(c.avg, c.remaining); got != c.want {
-			t.Errorf("batchETA(%v, %d) = %v, want %v", c.avg, c.remaining, got, c.want)
+		if got := ceilDiv(c.a, c.b); got != c.want {
+			t.Errorf("ceilDiv(%d, %d) = %d, want %d", c.a, c.b, got, c.want)
 		}
 	}
 }
 
-func TestEpisodeHeader(t *testing.T) {
+func TestBatchETA(t *testing.T) {
 	cases := []struct {
-		title        string
-		index, total int
-		eta          time.Duration
-		hasETA       bool
-		want         string
+		avg         time.Duration
+		remaining   int
+		concurrency int
+		want        time.Duration
 	}{
-		{"Solo Episode", 1, 1, 0, false, "downloading: Solo Episode"},
-		{"Episode Three", 3, 25, 0, false, "[3/25] downloading: Episode Three"},
-		{"Episode Three", 3, 25, 12*time.Minute + 34*time.Second, true, "[3/25] downloading: Episode Three — ETA 12m34s"},
+		{30 * time.Second, 4, 1, 2 * time.Minute},
+		{30 * time.Second, 4, 2, 1 * time.Minute},
+		{90 * time.Second, 1, 4, 90 * time.Second},
+		{0, 5, 4, 0},
 	}
 	for _, c := range cases {
-		if got := episodeHeader(c.title, c.index, c.total, c.eta, c.hasETA); got != c.want {
-			t.Errorf("episodeHeader(%q, %d, %d, %v, %v) = %q, want %q", c.title, c.index, c.total, c.eta, c.hasETA, got, c.want)
+		if got := batchETA(c.avg, c.remaining, c.concurrency); got != c.want {
+			t.Errorf("batchETA(%v, %d, %d) = %v, want %v", c.avg, c.remaining, c.concurrency, got, c.want)
 		}
 	}
+}
+
+func TestEpisodeLine(t *testing.T) {
+	cases := []struct {
+		index, total  int
+		title, status string
+		want          string
+	}{
+		{1, 1, "Solo Episode", "", "[1/1] Solo Episode"},
+		{3, 25, "Episode Three", "", "[3/25] Episode Three"},
+		{3, 25, "Episode Three", "12.3 MiB / 45.6 MiB (27%) ETA 8s", "[3/25] Episode Three — 12.3 MiB / 45.6 MiB (27%) ETA 8s"},
+	}
+	for _, c := range cases {
+		if got := episodeLine(c.index, c.total, c.title, c.status); got != c.want {
+			t.Errorf("episodeLine(%d, %d, %q, %q) = %q, want %q", c.index, c.total, c.title, c.status, got, c.want)
+		}
+	}
+}
+
+func TestSummaryLine(t *testing.T) {
+	cases := []struct {
+		downloaded int
+		totalBytes int64
+		elapsed    time.Duration
+		errCount   int
+		want       string
+	}{
+		{5, 10 * 1048576, 65 * time.Second, 0, "Downloaded 5 episode(s), 10.0 MiB, in 1m5s"},
+		{0, 0, 0, 2, "Downloaded 0 episode(s), 0 B, in 0s (2 error(s))"},
+	}
+	for _, c := range cases {
+		if got := summaryLine(c.downloaded, c.totalBytes, c.elapsed, c.errCount); got != c.want {
+			t.Errorf("summaryLine(...) = %q, want %q", got, c.want)
+		}
+	}
+}
+
+func TestClampConcurrency(t *testing.T) {
+	cases := []struct{ requested, total, want int }{
+		{0, 10, 1},
+		{-3, 10, 1},
+		{10, 4, 4},
+		{2, 10, 2},
+		{5, 0, 5},
+	}
+	for _, c := range cases {
+		if got := clampConcurrency(c.requested, c.total); got != c.want {
+			t.Errorf("clampConcurrency(%d, %d) = %d, want %d", c.requested, c.total, got, c.want)
+		}
+	}
+}
+
+func TestIsTerminal(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "not-a-terminal")
+	if err != nil {
+		t.Fatalf("creating temp file: %v", err)
+	}
+	defer f.Close()
+
+	if isTerminal(f) {
+		t.Error("expected a regular file to not be reported as a terminal")
+	}
+}
+
+func captureStdout(f func()) string {
+	r, w, err := os.Pipe()
+	if err != nil {
+		panic(err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	f()
+	w.Close()
+	os.Stdout = orig
+	out, _ := io.ReadAll(r)
+	return string(out)
+}
+
+func TestLiveDisplay(t *testing.T) {
+	t.Run("disabled display only prints log lines, no ANSI or progress text", func(t *testing.T) {
+		d := newLiveDisplay(2, false)
+		out := captureStdout(func() {
+			d.SetHeader("0/2 done")
+			d.SetSlot(0, "[1/2] Episode One — 50%")
+			d.Log("downloading: Episode One")
+			d.Stop()
+		})
+		if strings.Contains(out, "\x1b[") {
+			t.Errorf("expected no ANSI escapes when disabled, got %q", out)
+		}
+		if !strings.Contains(out, "downloading: Episode One") {
+			t.Errorf("expected log line in output, got %q", out)
+		}
+		if strings.Contains(out, "0/2 done") || strings.Contains(out, "50%") {
+			t.Errorf("expected header/slot text to be suppressed when disabled, got %q", out)
+		}
+	})
+
+	t.Run("enabled display renders header, slots, and log lines", func(t *testing.T) {
+		d := newLiveDisplay(1, true)
+		out := captureStdout(func() {
+			d.SetHeader("0/1 done")
+			d.SetSlot(0, "[1/1] Episode One — 50%")
+			d.Log("downloading: Episode One")
+			d.Stop()
+		})
+		if !strings.Contains(out, "\x1b[") {
+			t.Errorf("expected ANSI escapes when enabled, got %q", out)
+		}
+		if !strings.Contains(out, "0/1 done") {
+			t.Errorf("expected header text in output, got %q", out)
+		}
+		if !strings.Contains(out, "[1/1] Episode One — 50%") {
+			t.Errorf("expected slot text in output, got %q", out)
+		}
+		if !strings.Contains(out, "downloading: Episode One") {
+			t.Errorf("expected log line in output, got %q", out)
+		}
+	})
 }
 
 func TestParseFeed(t *testing.T) {
@@ -399,6 +517,10 @@ func TestEpisodeExtension(t *testing.T) {
 	}
 }
 
+func newTestDisplay() *liveDisplay {
+	return newLiveDisplay(1, false)
+}
+
 func TestDownloadEpisode(t *testing.T) {
 	t.Run("downloads via http and writes sanitized file", func(t *testing.T) {
 		const audioBody = "fake audio bytes"
@@ -418,12 +540,16 @@ func TestDownloadEpisode(t *testing.T) {
 			t.Fatalf("destinationPath = %q, want %q", dest, wantName)
 		}
 
-		downloaded, _, err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, 1, 1, 0, false)
+		pos := episodePosition{index: 1, total: 1, slot: 0}
+		downloaded, bytesWritten, _, err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, pos, newTestDisplay(), false)
 		if err != nil {
 			t.Fatalf("downloadEpisode returned error: %v", err)
 		}
 		if !downloaded {
 			t.Error("expected downloaded = true")
+		}
+		if bytesWritten != int64(len(audioBody)) {
+			t.Errorf("bytesWritten = %d, want %d", bytesWritten, len(audioBody))
 		}
 
 		got, err := os.ReadFile(dest)
@@ -452,7 +578,8 @@ func TestDownloadEpisode(t *testing.T) {
 			t.Fatal("setup: expected pubDate to parse")
 		}
 
-		if _, _, err := downloadEpisode(server.Client(), item, dest, pubTime, true, 1, 1, 0, false); err != nil {
+		pos := episodePosition{index: 1, total: 1, slot: 0}
+		if _, _, _, err := downloadEpisode(server.Client(), item, dest, pubTime, true, pos, newTestDisplay(), false); err != nil {
 			t.Fatalf("downloadEpisode returned error: %v", err)
 		}
 
@@ -483,7 +610,8 @@ func TestDownloadEpisode(t *testing.T) {
 			t.Fatalf("setup: writing existing file: %v", err)
 		}
 
-		downloaded, _, err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, 1, 1, 0, false)
+		pos := episodePosition{index: 1, total: 1, slot: 0}
+		downloaded, _, _, err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, pos, newTestDisplay(), false)
 		if err != nil {
 			t.Fatalf("downloadEpisode returned error: %v", err)
 		}
@@ -515,7 +643,8 @@ func TestDownloadEpisode(t *testing.T) {
 		item.Enclosure.URL = server.URL + "/missing.mp3"
 		dest := filepath.Join(dir, "Missing.mp3")
 
-		if _, _, err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, 1, 1, 0, false); err == nil {
+		pos := episodePosition{index: 1, total: 1, slot: 0}
+		if _, _, _, err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, pos, newTestDisplay(), false); err == nil {
 			t.Fatal("expected error for 404 response, got nil")
 		}
 	})

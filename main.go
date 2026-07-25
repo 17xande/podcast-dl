@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -233,115 +234,250 @@ func progressLine(written, total int64, elapsed time.Duration) string {
 	return line
 }
 
-// progressWriter is an io.Writer that prints download progress to stdout as
-// bytes flow through it, throttled so it doesn't flood the terminal.
+// progressWriter is an io.Writer that reports download progress as bytes
+// flow through it, throttled so it doesn't flood the display.
 type progressWriter struct {
 	total     int64
 	written   int64
 	start     time.Time
 	lastPrint time.Time
+	onUpdate  func(status string)
 }
 
-func newProgressWriter(total int64) *progressWriter {
-	return &progressWriter{total: total, start: time.Now()}
+func newProgressWriter(total int64, onUpdate func(status string)) *progressWriter {
+	return &progressWriter{total: total, start: time.Now(), onUpdate: onUpdate}
 }
 
 func (p *progressWriter) Write(b []byte) (int, error) {
 	p.written += int64(len(b))
 	if now := time.Now(); now.Sub(p.lastPrint) >= 150*time.Millisecond {
-		p.print()
+		p.onUpdate(progressLine(p.written, p.total, time.Since(p.start)))
 		p.lastPrint = now
 	}
 	return len(b), nil
 }
 
-func (p *progressWriter) print() {
-	fmt.Printf("\r  %s", progressLine(p.written, p.total, time.Since(p.start)))
-}
-
-func (p *progressWriter) finish() {
-	p.print()
-	fmt.Println()
-}
-
-// batchETA estimates the time remaining to finish a batch of downloads, based
-// on the average duration of the episodes downloaded so far.
-func batchETA(avgPerEpisode time.Duration, remaining int) time.Duration {
-	return (avgPerEpisode * time.Duration(remaining)).Round(time.Second)
-}
-
-// episodeHeader renders the line printed before an episode's progress bar,
-// including its position in the batch (e.g. "[3/25]") when more than one
-// episode is being downloaded, and an ETA for the remaining batch once one
-// has been estimated.
-func episodeHeader(title string, index, total int, eta time.Duration, hasETA bool) string {
-	line := fmt.Sprintf("downloading: %s", title)
-	if total > 1 {
-		line = fmt.Sprintf("[%d/%d] downloading: %s", index, total, title)
+// ceilDiv computes ceil(a/b), treating a non-positive b as no-op division.
+func ceilDiv(a, b int) int {
+	if b <= 0 {
+		return a
 	}
-	if hasETA {
-		line += fmt.Sprintf(" — ETA %s", eta)
+	return (a + b - 1) / b
+}
+
+// batchETA estimates the time remaining to finish a batch of downloads from
+// the average duration of episodes downloaded so far, accounting for up to
+// concurrency episodes progressing at once.
+func batchETA(avgPerEpisode time.Duration, remaining, concurrency int) time.Duration {
+	return (avgPerEpisode * time.Duration(ceilDiv(remaining, concurrency))).Round(time.Second)
+}
+
+// episodeLine renders a single episode's line in the live progress display,
+// e.g. "[3/25] Episode Title — 12.3 MiB / 45.6 MiB (27%) ETA 8s".
+func episodeLine(index, total int, title, status string) string {
+	line := fmt.Sprintf("[%d/%d] %s", index, total, title)
+	if status != "" {
+		line += " — " + status
 	}
 	return line
 }
 
-// downloadEpisode fetches the enclosure audio for item and writes it to
-// destPath, unless a file already exists there. index and total describe
-// this episode's position within the current batch; eta/hasETA (when set)
-// show an estimate of how long the remaining batch will take. When pubTime
-// is known, the downloaded file's access/modification times are set to the
-// episode's release date. It returns whether a download actually happened
-// (false when skipped) and how long it took, so callers can track the
-// running average used to compute later batch ETAs.
-func downloadEpisode(client *http.Client, item rssItem, destPath string, pubTime time.Time, hasPubTime bool, index, total int, eta time.Duration, hasETA bool) (downloaded bool, elapsed time.Duration, err error) {
-	if _, statErr := os.Stat(destPath); statErr == nil {
-		fmt.Printf("skip (exists): %s\n", item.Title)
-		return false, 0, nil
+// summaryLine renders the final report printed after all downloads finish.
+func summaryLine(downloaded int, totalBytes int64, elapsed time.Duration, errCount int) string {
+	line := fmt.Sprintf("Downloaded %d episode(s), %s, in %s", downloaded, formatBytes(totalBytes), elapsed.Round(time.Second))
+	if errCount > 0 {
+		line += fmt.Sprintf(" (%d error(s))", errCount)
 	}
+	return line
+}
+
+// isTerminal reports whether f appears to be an interactive terminal, as
+// opposed to a redirected file or pipe.
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// liveDisplay renders a fixed-size in-place status region (one header line
+// plus one line per concurrent download slot) using ANSI cursor movement,
+// so only currently active downloads are visible at once. Log lines (used
+// in verbose mode, and for errors) are printed above the region as normal
+// scrollback. When enabled is false (e.g. output isn't a terminal), all
+// live redraws are suppressed and only Log lines are printed.
+type liveDisplay struct {
+	mu      sync.Mutex
+	header  string
+	slots   []string
+	started bool
+	enabled bool
+}
+
+func newLiveDisplay(slots int, enabled bool) *liveDisplay {
+	return &liveDisplay{slots: make([]string, slots), enabled: enabled}
+}
+
+func (d *liveDisplay) lineCount() int { return len(d.slots) + 1 }
+
+// moveToTop moves the cursor to the region's first line, if it's already
+// been drawn once.
+func (d *liveDisplay) moveToTop() {
+	if d.started {
+		fmt.Printf("\x1b[%dA", d.lineCount())
+	}
+}
+
+// writeRegion (re)draws the header and every slot, each on its own cleared
+// line, assuming the cursor is already positioned at the region's top.
+func (d *liveDisplay) writeRegion() {
+	fmt.Printf("\r\x1b[2K%s\n", d.header)
+	for _, s := range d.slots {
+		fmt.Printf("\r\x1b[2K%s\n", s)
+	}
+	d.started = true
+}
+
+func (d *liveDisplay) redraw() {
+	if !d.enabled {
+		return
+	}
+	d.moveToTop()
+	d.writeRegion()
+}
+
+func (d *liveDisplay) SetHeader(text string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.header = text
+	d.redraw()
+}
+
+func (d *liveDisplay) SetSlot(i int, text string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.slots[i] = text
+	d.redraw()
+}
+
+// Log prints a permanent line above the live region (or, when disabled,
+// just prints it directly).
+func (d *liveDisplay) Log(line string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.enabled {
+		fmt.Println(line)
+		return
+	}
+	d.moveToTop()
+	fmt.Printf("\r\x1b[2K%s\n", line)
+	d.writeRegion()
+}
+
+// Stop erases the live region entirely, leaving the cursor where the region
+// used to start so subsequent output (e.g. a final summary) prints cleanly.
+func (d *liveDisplay) Stop() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.enabled && d.started {
+		d.moveToTop()
+		for i := 0; i < d.lineCount(); i++ {
+			fmt.Print("\r\x1b[2K\n")
+		}
+		d.moveToTop()
+	}
+	d.started = false
+}
+
+// episodePosition describes where an episode sits in the current batch and
+// which live-display slot its progress should be rendered into.
+type episodePosition struct {
+	index, total, slot int
+}
+
+// downloadEpisode fetches the enclosure audio for item and writes it to
+// destPath, unless a file already exists there. Progress is rendered into
+// display's slot for pos.slot; in verbose mode, lifecycle events (start,
+// skip, completion) are also logged as permanent lines. When pubTime is
+// known, the downloaded file's access/modification times are set to the
+// episode's release date. It returns whether a download actually happened
+// (false when skipped) and its size/duration, so callers can track batch
+// totals and the running average used for later ETAs.
+func downloadEpisode(client *http.Client, item rssItem, destPath string, pubTime time.Time, hasPubTime bool, pos episodePosition, display *liveDisplay, verbose bool) (downloaded bool, bytesWritten int64, elapsed time.Duration, err error) {
+	if _, statErr := os.Stat(destPath); statErr == nil {
+		if verbose {
+			display.Log(fmt.Sprintf("skip (exists): %s", item.Title))
+		}
+		return false, 0, 0, nil
+	}
+
+	if verbose {
+		display.Log(episodeLine(pos.index, pos.total, "downloading: "+item.Title, ""))
+	}
+	display.SetSlot(pos.slot, episodeLine(pos.index, pos.total, item.Title, "connecting..."))
+	defer display.SetSlot(pos.slot, "")
 
 	resp, err := client.Get(item.Enclosure.URL)
 	if err != nil {
-		return false, 0, fmt.Errorf("downloading %q: %w", item.Title, err)
+		return false, 0, 0, fmt.Errorf("downloading %q: %w", item.Title, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return false, 0, fmt.Errorf("downloading %q: unexpected status %s", item.Title, resp.Status)
+		return false, 0, 0, fmt.Errorf("downloading %q: unexpected status %s", item.Title, resp.Status)
 	}
 
 	out, err := os.Create(destPath)
 	if err != nil {
-		return false, 0, fmt.Errorf("creating file for %q: %w", item.Title, err)
+		return false, 0, 0, fmt.Errorf("creating file for %q: %w", item.Title, err)
 	}
 
-	fmt.Println(episodeHeader(item.Title, index, total, eta, hasETA))
-	progress := newProgressWriter(resp.ContentLength)
+	progress := newProgressWriter(resp.ContentLength, func(status string) {
+		display.SetSlot(pos.slot, episodeLine(pos.index, pos.total, item.Title, status))
+	})
 	if _, err := io.Copy(io.MultiWriter(out, progress), resp.Body); err != nil {
 		out.Close()
-		fmt.Println()
-		return false, 0, fmt.Errorf("saving %q: %w", item.Title, err)
+		return false, 0, 0, fmt.Errorf("saving %q: %w", item.Title, err)
 	}
-	progress.finish()
+	display.SetSlot(pos.slot, episodeLine(pos.index, pos.total, item.Title, progressLine(progress.written, progress.total, time.Since(progress.start))))
 
 	// Close before touching file metadata below: on Windows, an open
 	// handle blocks Chtimes/setCreationTime with a sharing violation.
 	if err := out.Close(); err != nil {
-		return false, 0, fmt.Errorf("closing file for %q: %w", item.Title, err)
+		return false, 0, 0, fmt.Errorf("closing file for %q: %w", item.Title, err)
 	}
 
 	if hasPubTime {
 		if err := os.Chtimes(destPath, pubTime, pubTime); err != nil {
-			return false, 0, fmt.Errorf("setting file date for %q: %w", item.Title, err)
+			return false, 0, 0, fmt.Errorf("setting file date for %q: %w", item.Title, err)
 		}
 		if err := setCreationTime(destPath, pubTime); err != nil {
-			return false, 0, fmt.Errorf("setting file creation date for %q: %w", item.Title, err)
+			return false, 0, 0, fmt.Errorf("setting file creation date for %q: %w", item.Title, err)
 		}
 	}
 
-	return true, time.Since(progress.start), nil
+	dur := time.Since(progress.start)
+	if verbose {
+		display.Log(fmt.Sprintf("downloaded: %s (%s in %s)", item.Title, formatBytes(progress.written), dur.Round(time.Second)))
+	}
+
+	return true, progress.written, dur, nil
 }
 
-func run(inputURL, outDir string, all bool) error {
+// clampConcurrency keeps the requested worker count sane: at least 1, and no
+// more than the number of episodes there are to download.
+func clampConcurrency(requested, total int) int {
+	if requested < 1 {
+		requested = 1
+	}
+	if total > 0 && requested > total {
+		requested = total
+	}
+	return requested
+}
+
+func run(inputURL, outDir string, all bool, concurrency int, verbose bool) error {
 	client := &http.Client{}
 
 	feedURL, err := resolveFeedURL(client, inputURL)
@@ -365,7 +501,8 @@ func run(inputURL, outDir string, all bool) error {
 	}
 
 	episodes := selectEpisodes(feed, all)
-	if len(episodes) == 0 {
+	total := len(episodes)
+	if total == 0 {
 		return fmt.Errorf("no episodes with downloadable audio found in feed")
 	}
 
@@ -373,29 +510,78 @@ func run(inputURL, outDir string, all bool) error {
 		return fmt.Errorf("creating output directory: %w", err)
 	}
 
-	total := len(episodes)
-	var completed int
-	var totalElapsed time.Duration
-	for i, item := range episodes {
-		dest := destinationPath(outDir, item)
-		pubTime, hasPubTime := parsePubDate(item.PubDate)
+	concurrency = clampConcurrency(concurrency, total)
 
-		var eta time.Duration
-		hasETA := completed > 0
-		if hasETA {
-			eta = batchETA(totalElapsed/time.Duration(completed), total-i)
+	display := newLiveDisplay(concurrency, isTerminal(os.Stdout))
+	display.SetHeader(fmt.Sprintf("0/%d done", total))
+	defer display.Stop()
+
+	type result struct {
+		downloaded bool
+		bytes      int64
+		elapsed    time.Duration
+		err        error
+	}
+
+	jobs := make(chan int)
+	results := make(chan result, total)
+
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for slot := 0; slot < concurrency; slot++ {
+		go func(slot int) {
+			defer wg.Done()
+			for i := range jobs {
+				item := episodes[i]
+				dest := destinationPath(outDir, item)
+				pubTime, hasPubTime := parsePubDate(item.PubDate)
+				pos := episodePosition{index: i + 1, total: total, slot: slot}
+				downloaded, bytesWritten, elapsed, err := downloadEpisode(client, item, dest, pubTime, hasPubTime, pos, display, verbose)
+				results <- result{downloaded, bytesWritten, elapsed, err}
+			}
+		}(slot)
+	}
+
+	go func() {
+		for i := range episodes {
+			jobs <- i
+		}
+		close(jobs)
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	start := time.Now()
+	var finished, downloadedCount, errCount int
+	var totalBytes int64
+	var totalDownloadTime time.Duration
+
+	for res := range results {
+		finished++
+		switch {
+		case res.err != nil:
+			errCount++
+			display.Log(fmt.Sprintf("error: %v", res.err))
+		case res.downloaded:
+			downloadedCount++
+			totalBytes += res.bytes
+			totalDownloadTime += res.elapsed
 		}
 
-		downloaded, elapsed, err := downloadEpisode(client, item, dest, pubTime, hasPubTime, i+1, total, eta, hasETA)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			continue
-		}
-		if downloaded {
-			completed++
-			totalElapsed += elapsed
+		remaining := total - finished
+		if downloadedCount > 0 && remaining > 0 {
+			eta := batchETA(totalDownloadTime/time.Duration(downloadedCount), remaining, concurrency)
+			display.SetHeader(fmt.Sprintf("%d/%d done — ETA %s", finished, total, eta))
+		} else {
+			display.SetHeader(fmt.Sprintf("%d/%d done", finished, total))
 		}
 	}
+
+	display.Stop()
+	fmt.Println(summaryLine(downloadedCount, totalBytes, time.Since(start), errCount))
 
 	return nil
 }
@@ -404,6 +590,8 @@ func main() {
 	url := flag.String("url", "", "podcast RSS feed URL, or an Apple Podcasts URL (required)")
 	all := flag.Bool("all", false, "download all episodes instead of just the latest")
 	out := flag.String("out", ".", "directory to save downloaded episodes into")
+	concurrency := flag.Int("concurrency", 4, "number of episodes to download at the same time")
+	verbose := flag.Bool("verbose", false, "log every download/skip instead of only showing active downloads")
 	flag.Parse()
 
 	if *url == "" {
@@ -412,7 +600,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(*url, *out, *all); err != nil {
+	if err := run(*url, *out, *all, *concurrency, *verbose); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
