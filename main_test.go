@@ -230,18 +230,38 @@ func TestProgressLine(t *testing.T) {
 	}
 }
 
+func TestBatchETA(t *testing.T) {
+	cases := []struct {
+		avg       time.Duration
+		remaining int
+		want      time.Duration
+	}{
+		{30 * time.Second, 4, 2 * time.Minute},
+		{90 * time.Second, 1, 90 * time.Second},
+		{0, 5, 0},
+	}
+	for _, c := range cases {
+		if got := batchETA(c.avg, c.remaining); got != c.want {
+			t.Errorf("batchETA(%v, %d) = %v, want %v", c.avg, c.remaining, got, c.want)
+		}
+	}
+}
+
 func TestEpisodeHeader(t *testing.T) {
 	cases := []struct {
 		title        string
 		index, total int
+		eta          time.Duration
+		hasETA       bool
 		want         string
 	}{
-		{"Solo Episode", 1, 1, "downloading: Solo Episode"},
-		{"Episode Three", 3, 25, "[3/25] downloading: Episode Three"},
+		{"Solo Episode", 1, 1, 0, false, "downloading: Solo Episode"},
+		{"Episode Three", 3, 25, 0, false, "[3/25] downloading: Episode Three"},
+		{"Episode Three", 3, 25, 12*time.Minute + 34*time.Second, true, "[3/25] downloading: Episode Three — ETA 12m34s"},
 	}
 	for _, c := range cases {
-		if got := episodeHeader(c.title, c.index, c.total); got != c.want {
-			t.Errorf("episodeHeader(%q, %d, %d) = %q, want %q", c.title, c.index, c.total, got, c.want)
+		if got := episodeHeader(c.title, c.index, c.total, c.eta, c.hasETA); got != c.want {
+			t.Errorf("episodeHeader(%q, %d, %d, %v, %v) = %q, want %q", c.title, c.index, c.total, c.eta, c.hasETA, got, c.want)
 		}
 	}
 }
@@ -398,8 +418,12 @@ func TestDownloadEpisode(t *testing.T) {
 			t.Fatalf("destinationPath = %q, want %q", dest, wantName)
 		}
 
-		if err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, 1, 1); err != nil {
+		downloaded, _, err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, 1, 1, 0, false)
+		if err != nil {
 			t.Fatalf("downloadEpisode returned error: %v", err)
+		}
+		if !downloaded {
+			t.Error("expected downloaded = true")
 		}
 
 		got, err := os.ReadFile(dest)
@@ -428,7 +452,7 @@ func TestDownloadEpisode(t *testing.T) {
 			t.Fatal("setup: expected pubDate to parse")
 		}
 
-		if err := downloadEpisode(server.Client(), item, dest, pubTime, true, 1, 1); err != nil {
+		if _, _, err := downloadEpisode(server.Client(), item, dest, pubTime, true, 1, 1, 0, false); err != nil {
 			t.Fatalf("downloadEpisode returned error: %v", err)
 		}
 
@@ -459,8 +483,12 @@ func TestDownloadEpisode(t *testing.T) {
 			t.Fatalf("setup: writing existing file: %v", err)
 		}
 
-		if err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, 1, 1); err != nil {
+		downloaded, _, err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, 1, 1, 0, false)
+		if err != nil {
 			t.Fatalf("downloadEpisode returned error: %v", err)
+		}
+		if downloaded {
+			t.Error("expected downloaded = false when file already exists")
 		}
 
 		if calls != 0 {
@@ -487,7 +515,7 @@ func TestDownloadEpisode(t *testing.T) {
 		item.Enclosure.URL = server.URL + "/missing.mp3"
 		dest := filepath.Join(dir, "Missing.mp3")
 
-		if err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, 1, 1); err == nil {
+		if _, _, err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, 1, 1, 0, false); err == nil {
 			t.Fatal("expected error for 404 response, got nil")
 		}
 	})

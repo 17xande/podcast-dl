@@ -264,67 +264,81 @@ func (p *progressWriter) finish() {
 	fmt.Println()
 }
 
+// batchETA estimates the time remaining to finish a batch of downloads, based
+// on the average duration of the episodes downloaded so far.
+func batchETA(avgPerEpisode time.Duration, remaining int) time.Duration {
+	return (avgPerEpisode * time.Duration(remaining)).Round(time.Second)
+}
+
 // episodeHeader renders the line printed before an episode's progress bar,
 // including its position in the batch (e.g. "[3/25]") when more than one
-// episode is being downloaded.
-func episodeHeader(title string, index, total int) string {
+// episode is being downloaded, and an ETA for the remaining batch once one
+// has been estimated.
+func episodeHeader(title string, index, total int, eta time.Duration, hasETA bool) string {
+	line := fmt.Sprintf("downloading: %s", title)
 	if total > 1 {
-		return fmt.Sprintf("[%d/%d] downloading: %s", index, total, title)
+		line = fmt.Sprintf("[%d/%d] downloading: %s", index, total, title)
 	}
-	return fmt.Sprintf("downloading: %s", title)
+	if hasETA {
+		line += fmt.Sprintf(" — ETA %s", eta)
+	}
+	return line
 }
 
 // downloadEpisode fetches the enclosure audio for item and writes it to
 // destPath, unless a file already exists there. index and total describe
-// this episode's position within the current batch, for progress display.
-// When pubTime is known, the downloaded file's access/modification times are
-// set to the episode's release date.
-func downloadEpisode(client *http.Client, item rssItem, destPath string, pubTime time.Time, hasPubTime bool, index, total int) error {
-	if _, err := os.Stat(destPath); err == nil {
+// this episode's position within the current batch; eta/hasETA (when set)
+// show an estimate of how long the remaining batch will take. When pubTime
+// is known, the downloaded file's access/modification times are set to the
+// episode's release date. It returns whether a download actually happened
+// (false when skipped) and how long it took, so callers can track the
+// running average used to compute later batch ETAs.
+func downloadEpisode(client *http.Client, item rssItem, destPath string, pubTime time.Time, hasPubTime bool, index, total int, eta time.Duration, hasETA bool) (downloaded bool, elapsed time.Duration, err error) {
+	if _, statErr := os.Stat(destPath); statErr == nil {
 		fmt.Printf("skip (exists): %s\n", item.Title)
-		return nil
+		return false, 0, nil
 	}
 
 	resp, err := client.Get(item.Enclosure.URL)
 	if err != nil {
-		return fmt.Errorf("downloading %q: %w", item.Title, err)
+		return false, 0, fmt.Errorf("downloading %q: %w", item.Title, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("downloading %q: unexpected status %s", item.Title, resp.Status)
+		return false, 0, fmt.Errorf("downloading %q: unexpected status %s", item.Title, resp.Status)
 	}
 
 	out, err := os.Create(destPath)
 	if err != nil {
-		return fmt.Errorf("creating file for %q: %w", item.Title, err)
+		return false, 0, fmt.Errorf("creating file for %q: %w", item.Title, err)
 	}
 
-	fmt.Println(episodeHeader(item.Title, index, total))
+	fmt.Println(episodeHeader(item.Title, index, total, eta, hasETA))
 	progress := newProgressWriter(resp.ContentLength)
 	if _, err := io.Copy(io.MultiWriter(out, progress), resp.Body); err != nil {
 		out.Close()
 		fmt.Println()
-		return fmt.Errorf("saving %q: %w", item.Title, err)
+		return false, 0, fmt.Errorf("saving %q: %w", item.Title, err)
 	}
 	progress.finish()
 
 	// Close before touching file metadata below: on Windows, an open
 	// handle blocks Chtimes/setCreationTime with a sharing violation.
 	if err := out.Close(); err != nil {
-		return fmt.Errorf("closing file for %q: %w", item.Title, err)
+		return false, 0, fmt.Errorf("closing file for %q: %w", item.Title, err)
 	}
 
 	if hasPubTime {
 		if err := os.Chtimes(destPath, pubTime, pubTime); err != nil {
-			return fmt.Errorf("setting file date for %q: %w", item.Title, err)
+			return false, 0, fmt.Errorf("setting file date for %q: %w", item.Title, err)
 		}
 		if err := setCreationTime(destPath, pubTime); err != nil {
-			return fmt.Errorf("setting file creation date for %q: %w", item.Title, err)
+			return false, 0, fmt.Errorf("setting file creation date for %q: %w", item.Title, err)
 		}
 	}
 
-	return nil
+	return true, time.Since(progress.start), nil
 }
 
 func run(inputURL, outDir string, all bool) error {
@@ -360,11 +374,26 @@ func run(inputURL, outDir string, all bool) error {
 	}
 
 	total := len(episodes)
+	var completed int
+	var totalElapsed time.Duration
 	for i, item := range episodes {
 		dest := destinationPath(outDir, item)
 		pubTime, hasPubTime := parsePubDate(item.PubDate)
-		if err := downloadEpisode(client, item, dest, pubTime, hasPubTime, i+1, total); err != nil {
+
+		var eta time.Duration
+		hasETA := completed > 0
+		if hasETA {
+			eta = batchETA(totalElapsed/time.Duration(completed), total-i)
+		}
+
+		downloaded, elapsed, err := downloadEpisode(client, item, dest, pubTime, hasPubTime, i+1, total, eta, hasETA)
+		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
+			continue
+		}
+		if downloaded {
+			completed++
+			totalElapsed += elapsed
 		}
 	}
 
