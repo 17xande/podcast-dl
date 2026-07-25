@@ -18,7 +18,7 @@ func setCreationTime(path string, t time.Time) error {
 	handle, err := syscall.CreateFile(
 		pathPtr,
 		syscall.GENERIC_WRITE,
-		syscall.FILE_SHARE_WRITE,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE|syscall.FILE_SHARE_DELETE,
 		nil,
 		syscall.OPEN_EXISTING,
 		syscall.FILE_ATTRIBUTE_NORMAL,

@@ -299,15 +299,21 @@ func downloadEpisode(client *http.Client, item rssItem, destPath string, pubTime
 	if err != nil {
 		return fmt.Errorf("creating file for %q: %w", item.Title, err)
 	}
-	defer out.Close()
 
 	fmt.Println(episodeHeader(item.Title, index, total))
 	progress := newProgressWriter(resp.ContentLength)
 	if _, err := io.Copy(io.MultiWriter(out, progress), resp.Body); err != nil {
+		out.Close()
 		fmt.Println()
 		return fmt.Errorf("saving %q: %w", item.Title, err)
 	}
 	progress.finish()
+
+	// Close before touching file metadata below: on Windows, an open
+	// handle blocks Chtimes/setCreationTime with a sharing violation.
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("closing file for %q: %w", item.Title, err)
+	}
 
 	if hasPubTime {
 		if err := os.Chtimes(destPath, pubTime, pubTime); err != nil {
