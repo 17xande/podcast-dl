@@ -1,1 +1,3 @@
 /podcast-dl
+*.exe
+.claude/

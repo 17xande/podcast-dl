@@ -177,12 +177,12 @@ func episodeExtension(enclosureURL string) string {
 }
 
 // destinationPath builds the file path an episode should be saved to,
-// prefixing the sanitized title with its release date (YYYY-MM-DD) when the
+// appending its release date (YYYY-MM-DD) after the sanitized title when the
 // feed provides a parseable pubDate.
 func destinationPath(outDir string, item rssItem) string {
 	name := sanitizeFilename(item.Title)
 	if t, ok := parsePubDate(item.PubDate); ok {
-		name = t.Format("2006-01-02") + " - " + name
+		name = name + " - " + t.Format("2006-01-02")
 	}
 	return filepath.Join(outDir, name+episodeExtension(item.Enclosure.URL))
 }
@@ -201,14 +201,36 @@ func formatBytes(n int64) string {
 	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-// progressLine renders a download progress status, including a percentage
-// when the total size is known.
-func progressLine(written, total int64) string {
-	if total > 0 {
-		pct := float64(written) / float64(total) * 100
-		return fmt.Sprintf("%s / %s (%.0f%%)", formatBytes(written), formatBytes(total), pct)
+// estimateETA estimates the remaining download time from the average
+// transfer rate observed so far, returning ok=false when there isn't enough
+// information yet to estimate.
+func estimateETA(written, total int64, elapsed time.Duration) (time.Duration, bool) {
+	if written <= 0 || total <= 0 || elapsed <= 0 {
+		return 0, false
 	}
-	return formatBytes(written)
+	remaining := total - written
+	if remaining <= 0 {
+		return 0, true
+	}
+	rate := float64(written) / elapsed.Seconds()
+	if rate <= 0 {
+		return 0, false
+	}
+	return time.Duration(float64(remaining) / rate * float64(time.Second)).Round(time.Second), true
+}
+
+// progressLine renders a download progress status, including a percentage
+// and ETA when the total size is known.
+func progressLine(written, total int64, elapsed time.Duration) string {
+	if total <= 0 {
+		return formatBytes(written)
+	}
+	pct := float64(written) / float64(total) * 100
+	line := fmt.Sprintf("%s / %s (%.0f%%)", formatBytes(written), formatBytes(total), pct)
+	if eta, ok := estimateETA(written, total, elapsed); ok {
+		line += fmt.Sprintf(" ETA %s", eta)
+	}
+	return line
 }
 
 // progressWriter is an io.Writer that prints download progress to stdout as
@@ -216,7 +238,12 @@ func progressLine(written, total int64) string {
 type progressWriter struct {
 	total     int64
 	written   int64
+	start     time.Time
 	lastPrint time.Time
+}
+
+func newProgressWriter(total int64) *progressWriter {
+	return &progressWriter{total: total, start: time.Now()}
 }
 
 func (p *progressWriter) Write(b []byte) (int, error) {
@@ -229,7 +256,7 @@ func (p *progressWriter) Write(b []byte) (int, error) {
 }
 
 func (p *progressWriter) print() {
-	fmt.Printf("\r  %s", progressLine(p.written, p.total))
+	fmt.Printf("\r  %s", progressLine(p.written, p.total, time.Since(p.start)))
 }
 
 func (p *progressWriter) finish() {
@@ -237,11 +264,22 @@ func (p *progressWriter) finish() {
 	fmt.Println()
 }
 
+// episodeHeader renders the line printed before an episode's progress bar,
+// including its position in the batch (e.g. "[3/25]") when more than one
+// episode is being downloaded.
+func episodeHeader(title string, index, total int) string {
+	if total > 1 {
+		return fmt.Sprintf("[%d/%d] downloading: %s", index, total, title)
+	}
+	return fmt.Sprintf("downloading: %s", title)
+}
+
 // downloadEpisode fetches the enclosure audio for item and writes it to
-// destPath, unless a file already exists there. When pubTime is known, the
-// downloaded file's access/modification times are set to the episode's
-// release date.
-func downloadEpisode(client *http.Client, item rssItem, destPath string, pubTime time.Time, hasPubTime bool) error {
+// destPath, unless a file already exists there. index and total describe
+// this episode's position within the current batch, for progress display.
+// When pubTime is known, the downloaded file's access/modification times are
+// set to the episode's release date.
+func downloadEpisode(client *http.Client, item rssItem, destPath string, pubTime time.Time, hasPubTime bool, index, total int) error {
 	if _, err := os.Stat(destPath); err == nil {
 		fmt.Printf("skip (exists): %s\n", item.Title)
 		return nil
@@ -263,8 +301,8 @@ func downloadEpisode(client *http.Client, item rssItem, destPath string, pubTime
 	}
 	defer out.Close()
 
-	fmt.Printf("downloading: %s\n", item.Title)
-	progress := &progressWriter{total: resp.ContentLength}
+	fmt.Println(episodeHeader(item.Title, index, total))
+	progress := newProgressWriter(resp.ContentLength)
 	if _, err := io.Copy(io.MultiWriter(out, progress), resp.Body); err != nil {
 		fmt.Println()
 		return fmt.Errorf("saving %q: %w", item.Title, err)
@@ -315,10 +353,11 @@ func run(inputURL, outDir string, all bool) error {
 		return fmt.Errorf("creating output directory: %w", err)
 	}
 
-	for _, item := range episodes {
+	total := len(episodes)
+	for i, item := range episodes {
 		dest := destinationPath(outDir, item)
 		pubTime, hasPubTime := parsePubDate(item.PubDate)
-		if err := downloadEpisode(client, item, dest, pubTime, hasPubTime); err != nil {
+		if err := downloadEpisode(client, item, dest, pubTime, hasPubTime, i+1, total); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 		}
 	}

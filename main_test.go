@@ -184,19 +184,64 @@ func TestFormatBytes(t *testing.T) {
 	}
 }
 
+func TestEstimateETA(t *testing.T) {
+	cases := []struct {
+		name           string
+		written, total int64
+		elapsed        time.Duration
+		want           time.Duration
+		wantOK         bool
+	}{
+		{"halfway after 10s takes another 10s", 50, 100, 10 * time.Second, 10 * time.Second, true},
+		{"complete has zero eta", 100, 100, 10 * time.Second, 0, true},
+		{"no bytes written yet", 0, 100, 10 * time.Second, 0, false},
+		{"unknown total", 50, -1, 10 * time.Second, 0, false},
+		{"no elapsed time yet", 50, 100, 0, 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := estimateETA(c.written, c.total, c.elapsed)
+			if ok != c.wantOK {
+				t.Fatalf("estimateETA(...) ok = %v, want %v", ok, c.wantOK)
+			}
+			if ok && got != c.want {
+				t.Errorf("estimateETA(...) = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
 func TestProgressLine(t *testing.T) {
 	cases := []struct {
 		written, total int64
+		elapsed        time.Duration
 		want           string
 	}{
-		{512, 1024, "512 B / 1.0 KiB (50%)"},
-		{1024, 1024, "1.0 KiB / 1.0 KiB (100%)"},
-		{2048, -1, "2.0 KiB"},
-		{2048, 0, "2.0 KiB"},
+		{512, 1024, 0, "512 B / 1.0 KiB (50%)"},
+		{1024, 1024, 10 * time.Second, "1.0 KiB / 1.0 KiB (100%) ETA 0s"},
+		{50, 100, 10 * time.Second, "50 B / 100 B (50%) ETA 10s"},
+		{2048, -1, 0, "2.0 KiB"},
+		{2048, 0, 0, "2.0 KiB"},
 	}
 	for _, c := range cases {
-		if got := progressLine(c.written, c.total); got != c.want {
-			t.Errorf("progressLine(%d, %d) = %q, want %q", c.written, c.total, got, c.want)
+		if got := progressLine(c.written, c.total, c.elapsed); got != c.want {
+			t.Errorf("progressLine(%d, %d, %v) = %q, want %q", c.written, c.total, c.elapsed, got, c.want)
+		}
+	}
+}
+
+func TestEpisodeHeader(t *testing.T) {
+	cases := []struct {
+		title        string
+		index, total int
+		want         string
+	}{
+		{"Solo Episode", 1, 1, "downloading: Solo Episode"},
+		{"Episode Three", 3, 25, "[3/25] downloading: Episode Three"},
+	}
+	for _, c := range cases {
+		if got := episodeHeader(c.title, c.index, c.total); got != c.want {
+			t.Errorf("episodeHeader(%q, %d, %d) = %q, want %q", c.title, c.index, c.total, got, c.want)
 		}
 	}
 }
@@ -292,12 +337,12 @@ func TestSelectEpisodes(t *testing.T) {
 func TestDestinationPath(t *testing.T) {
 	dir := t.TempDir()
 
-	t.Run("prefixes with release date when pubDate parses", func(t *testing.T) {
+	t.Run("appends release date when pubDate parses", func(t *testing.T) {
 		item := rssItem{Title: "Episode Title", PubDate: "Sat, 25 Jul 2026 10:30:00 -0400"}
 		item.Enclosure.URL = "https://example.com/ep.mp3"
 
 		got := destinationPath(dir, item)
-		want := filepath.Join(dir, "2026-07-25 - Episode Title.mp3")
+		want := filepath.Join(dir, "Episode Title - 2026-07-25.mp3")
 		if got != want {
 			t.Errorf("destinationPath = %q, want %q", got, want)
 		}
@@ -353,7 +398,7 @@ func TestDownloadEpisode(t *testing.T) {
 			t.Fatalf("destinationPath = %q, want %q", dest, wantName)
 		}
 
-		if err := downloadEpisode(server.Client(), item, dest, time.Time{}, false); err != nil {
+		if err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, 1, 1); err != nil {
 			t.Fatalf("downloadEpisode returned error: %v", err)
 		}
 
@@ -383,7 +428,7 @@ func TestDownloadEpisode(t *testing.T) {
 			t.Fatal("setup: expected pubDate to parse")
 		}
 
-		if err := downloadEpisode(server.Client(), item, dest, pubTime, true); err != nil {
+		if err := downloadEpisode(server.Client(), item, dest, pubTime, true, 1, 1); err != nil {
 			t.Fatalf("downloadEpisode returned error: %v", err)
 		}
 
@@ -414,7 +459,7 @@ func TestDownloadEpisode(t *testing.T) {
 			t.Fatalf("setup: writing existing file: %v", err)
 		}
 
-		if err := downloadEpisode(server.Client(), item, dest, time.Time{}, false); err != nil {
+		if err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, 1, 1); err != nil {
 			t.Fatalf("downloadEpisode returned error: %v", err)
 		}
 
@@ -442,7 +487,7 @@ func TestDownloadEpisode(t *testing.T) {
 		item.Enclosure.URL = server.URL + "/missing.mp3"
 		dest := filepath.Join(dir, "Missing.mp3")
 
-		if err := downloadEpisode(server.Client(), item, dest, time.Time{}, false); err == nil {
+		if err := downloadEpisode(server.Client(), item, dest, time.Time{}, false, 1, 1); err == nil {
 			t.Fatal("expected error for 404 response, got nil")
 		}
 	})
